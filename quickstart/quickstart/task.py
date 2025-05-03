@@ -1,65 +1,72 @@
 """quickstart: A Flower / PyTorch app."""
-
+import os
 from collections import OrderedDict
+from typing import Any
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from flwr_datasets import FederatedDataset
-from flwr_datasets.partitioner import IidPartitioner
+from datasets import load_dataset
+from flwr_datasets.partitioner import NaturalIdPartitioner
 from torch.utils.data import DataLoader
-from torchvision.transforms import Compose, Normalize, ToTensor
 
 
 class Net(nn.Module):
-    """Model (simple CNN adapted from 'PyTorch: A 60 Minute Blitz')"""
 
     def __init__(self):
         super(Net, self).__init__()
-        self.conv1 = nn.Conv2d(3, 6, 5)
-        self.pool = nn.MaxPool2d(2, 2)
-        self.conv2 = nn.Conv2d(6, 16, 5)
-        self.fc1 = nn.Linear(16 * 5 * 5, 120)
-        self.fc2 = nn.Linear(120, 84)
-        self.fc3 = nn.Linear(84, 10)
+
+        self.layer = nn.Sequential(
+            nn.Linear(1, 256),
+            nn.Sigmoid(),
+            nn.Linear(256, 256),
+            nn.Sigmoid(),
+            nn.Dropout(),
+            nn.Linear(256, 10),
+        )
 
     def forward(self, x):
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = x.view(-1, 16 * 5 * 5)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        return self.fc3(x)
+        x = x.view(x.size(0), -1)  # Flatten the input
 
+        #print(f"###################### Input Shape: {x.shape}")
+        #print(f"###################### Layer Shape: {self.layer[0].weight.shape}")
+        #print(f"###################### Input Dtype: {x.dtype}")
+        #print(f"###################### Layer Dtype: {self.layer[0].weight.dtype}")
 
-fds = None  # Cache FederatedDataset
+        x = self.layer(x)
+        return x
 
 
 def load_data(partition_id: int, num_partitions: int):
-    """Load partition CIFAR10 data."""
-    # Only initialize `FederatedDataset` once
-    global fds
-    if fds is None:
-        partitioner = IidPartitioner(num_partitions=num_partitions)
-        fds = FederatedDataset(
-            dataset="uoft-cs/cifar10",
-            partitioners={"train": partitioner},
-        )
-    partition = fds.load_partition(partition_id)
+    """Load partition HelpDesk data."""
+
+    # Get the path to the simulated data file
+    _dir = os.path.dirname(os.path.abspath(__file__))
+    data_file_path = os.path.join(os.path.join(_dir, "data"), "IoT")
+    data_file = os.path.join(data_file_path, f"activity_{partition_id + 1}.csv")
+
+    partitioner = NaturalIdPartitioner(partition_by="ActivityID")
+
+    # Load edge local dataset
+    print(f"###################### Loading data from {data_file}")
+    fds = load_dataset("csv", data_files=data_file, split='train')
+    print(f"###################### Raw dataset loaded: {fds.batch}")
+    partitioner.dataset = fds
+
+    partition = partitioner.load_partition(0)
+    #print(f"##################### Loaded partition {partition_id} with {len(partition)} samples")
+    #print(f"##################### Partition: {partition}")
+
     # Divide data on each node: 80% train, 20% test
     partition_train_test = partition.train_test_split(test_size=0.2, seed=42)
-    pytorch_transforms = Compose(
-        [ToTensor(), Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
-    )
 
-    def apply_transforms(batch):
+    def apply_transforms(batch: dict[str, Any]):
         """Apply transforms to the partition from FederatedDataset."""
-        batch["img"] = [pytorch_transforms(img) for img in batch["img"]]
         return batch
 
     partition_train_test = partition_train_test.with_transform(apply_transforms)
-    trainloader = DataLoader(partition_train_test["train"], batch_size=32, shuffle=True)
-    testloader = DataLoader(partition_train_test["test"], batch_size=32)
+
+    trainloader = DataLoader(partition_train_test["train"], shuffle=True)
+    testloader = DataLoader(partition_train_test["test"])
     return trainloader, testloader
 
 
@@ -67,20 +74,30 @@ def train(net, trainloader, epochs, device):
     """Train the model on the training set."""
     net.to(device)  # move model to GPU if available
     criterion = torch.nn.CrossEntropyLoss().to(device)
-    optimizer = torch.optim.Adam(net.parameters(), lr=0.01)
+    optimizer = torch.optim.Adam(net.parameters(), lr=1e-03)
     net.train()
     running_loss = 0.0
+
     for _ in range(epochs):
         for batch in trainloader:
-            images = batch["img"]
-            labels = batch["label"]
+            current_activity_id_ds = batch["ActivityID"].to(torch.float32).to(device)
+            next_activity_id_labels = batch["PreActivityID"].to(torch.long).to(device)
+
+            print(f"###################### TRAIN - Input: {current_activity_id_ds}")
+            print(f"###################### TRAIN - Label: {next_activity_id_labels}")
+
             optimizer.zero_grad()
-            loss = criterion(net(images.to(device)), labels.to(device))
+
+            predicted_activity_id =  torch.argmax(net(current_activity_id_ds), dim=1)
+            print(f"###################### TRAIN - Predict: {predicted_activity_id}")
+
+            loss = criterion(net(current_activity_id_ds).reshape((1,-1)), next_activity_id_labels.reshape((-1)))
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
 
     avg_trainloss = running_loss / len(trainloader)
+    print(f"###################### TRAIN - Average Loss: {avg_trainloss}")
     return avg_trainloss
 
 
@@ -91,13 +108,21 @@ def test(net, testloader, device):
     correct, loss = 0, 0.0
     with torch.no_grad():
         for batch in testloader:
-            images = batch["img"].to(device)
-            labels = batch["label"].to(device)
-            outputs = net(images)
-            loss += criterion(outputs, labels).item()
-            correct += (torch.max(outputs.data, 1)[1] == labels).sum().item()
+            current_activity_id_ds = batch["ActivityID"].to(torch.float32).to(device)
+            next_activity_id_labels = batch["PreActivityID"].to(torch.long).to(device)
+
+            print(f"###################### TEST- Input: {current_activity_id_ds}")
+            print(f"###################### TEST- Label: {next_activity_id_labels}")
+
+            outputs = torch.argmax(net(current_activity_id_ds), dim=1)
+            print(f"###################### TEST - Outputs: {outputs}")
+
+            loss += criterion(net(current_activity_id_ds).reshape((1,-1)), next_activity_id_labels.reshape((-1))).item()
+            correct += (outputs == next_activity_id_labels).item()
     accuracy = correct / len(testloader.dataset)
+    print(f"###################### TEST - Accuracy: {accuracy}")
     loss = loss / len(testloader)
+    print(f"###################### TEST - Loss: {loss}")
     return loss, accuracy
 
 
