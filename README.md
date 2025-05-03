@@ -25,7 +25,7 @@ The clients would train data with a general MLP model with Linear layers and Sig
 Then the validation would be calculated with CrossEntropyLoss function.
 After an epoch, all training results would be transfered to server and aggregated.
 
-![gif](pictures/flower.gif)
+![gif](pictures/flower_architecture.gif)
 
 ### Explaination
 
